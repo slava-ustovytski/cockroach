@@ -218,6 +218,22 @@ func (sp *StorePool) start(stopper *stop.Stopper) {
 	})
 }
 
+// GetStoreDescriptor returns the store detail for the given storeID.
+func (sp *StorePool) getStoreDetail(storeID proto.StoreID) *storeDetail {
+	sp.mu.RLock()
+	defer sp.mu.RUnlock()
+
+	detail, ok := sp.stores[storeID]
+	if !ok {
+		return nil
+	}
+
+	// Make a copy of detail for thread safety.
+	result := new(storeDetail)
+	*result = *detail
+	return result
+}
+
 // GetStoreDescriptor returns the latest store descriptor for the given
 // storeID.
 func (sp *StorePool) getStoreDescriptor(storeID proto.StoreID) *proto.StoreDescriptor {
