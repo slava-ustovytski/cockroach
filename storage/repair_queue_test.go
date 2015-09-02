@@ -90,37 +90,52 @@ func TestRepairQueueNeedsRepair(t *testing.T) {
 		ePriority      int
 		eReplicas      []proto.Replica
 	}{
-		// Test 0: All alive, nothing to do.
+		// Test 0: three stores, all alive, nothing to do
 		{
 			replica:        createTestReplicaForRepair([]proto.StoreID{1, 2, 3}),
 			storePoolAlive: []proto.StoreID{1, 2, 3},
 			storePoolDead:  []proto.StoreID{},
 		},
-		// Test 1: One dead store, repair that store.
+		// Test 1: three stores, one dead store, repair the store
 		{
 			replica:        createTestReplicaForRepair([]proto.StoreID{1, 2, 3}),
 			storePoolAlive: []proto.StoreID{1, 2},
 			storePoolDead:  []proto.StoreID{3},
 			eNeeds:         true,
-			ePriority:      1,
+			ePriority:      0,
 			eReplicas:      createReplicaSets([]proto.StoreID{3}),
 		},
-		// Test 2: Two dead stores, can't repair due to not having quorum.
+		// Test 2: three stores, two dead stores, can't repair due to not having quorum
 		{
 			replica:        createTestReplicaForRepair([]proto.StoreID{1, 2, 3}),
 			storePoolAlive: []proto.StoreID{1},
 			storePoolDead:  []proto.StoreID{2, 3},
-			ePriority:      2,
+			ePriority:      1,
 			eReplicas:      createReplicaSets([]proto.StoreID{2, 3}),
 		},
-		// Test 3: Two dead stores, both should be repaired.
+		// Test 3: five store, two dead stores, both should be repaired
 		{
 			replica:        createTestReplicaForRepair([]proto.StoreID{1, 2, 3, 4, 5}),
 			storePoolAlive: []proto.StoreID{1, 2, 3},
 			storePoolDead:  []proto.StoreID{4, 5},
 			eNeeds:         true,
-			ePriority:      2,
+			ePriority:      0,
 			eReplicas:      createReplicaSets([]proto.StoreID{4, 5}),
+		},
+		// Test 4: five store, one dead stores, repair the store
+		{
+			replica:        createTestReplicaForRepair([]proto.StoreID{1, 2, 3, 4, 5}),
+			storePoolAlive: []proto.StoreID{1, 2, 3, 4},
+			storePoolDead:  []proto.StoreID{5},
+			eNeeds:         true,
+			ePriority:      -1,
+			eReplicas:      createReplicaSets([]proto.StoreID{5}),
+		},
+		// Test 5: three stores, all alive, but only 1 is in the store pool, nothing to do
+		{
+			replica:        createTestReplicaForRepair([]proto.StoreID{1, 2, 3}),
+			storePoolAlive: []proto.StoreID{1},
+			storePoolDead:  []proto.StoreID{},
 		},
 	}
 

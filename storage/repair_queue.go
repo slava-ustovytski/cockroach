@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/proto"
+	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 )
@@ -75,8 +76,7 @@ func (rq repairQueue) needsRepair(repl *Replica) (bool, float64, []proto.Replica
 	rangeDesc := repl.Desc()
 	var deadReplicas []proto.Replica
 	for _, otherRepl := range rangeDesc.Replicas {
-		storeDetail := rq.storePool.getStoreDetail(otherRepl.StoreID)
-		if storeDetail == nil || storeDetail.dead {
+		if rq.storePool.getStoreDetail(otherRepl.StoreID).dead {
 			deadReplicas = append(deadReplicas, otherRepl)
 		}
 	}
@@ -89,7 +89,14 @@ func (rq repairQueue) needsRepair(repl *Replica) (bool, float64, []proto.Replica
 	// one without at least a quorum.
 	quorum := (len(rangeDesc.Replicas) / 2) + 1
 	liveReplicas := len(rangeDesc.Replicas) - len(deadReplicas)
-	return liveReplicas >= quorum, float64(len(deadReplicas)), deadReplicas
+
+	// Priority is calculated based on need. By basing this off of the number
+	// of live replicas over he quorum amount ensures that in the case where a
+	// 5 replica range is only missing one it gets a lower priority than a 3
+	// replica range missing 1. Note that this may produce negative priorities,
+	// but these are correctly handled by baseQueue.
+	priority := float64(quorum - liveReplicas)
+	return liveReplicas >= quorum, priority, deadReplicas
 }
 
 // process implements the queueImpl interface.
@@ -99,22 +106,26 @@ func (rq repairQueue) needsRepair(repl *Replica) (bool, float64, []proto.Replica
 func (rq repairQueue) process(now proto.Timestamp, repl *Replica) error {
 	shouldQ, _, deadReplicas := rq.needsRepair(repl)
 	if !shouldQ {
+		// No more dead replicas, enqueue the replica in the replicate queue so
+		// any missing replicas can be added.
+		rq.replicateQueue.MaybeAdd(repl, rq.clock.Now())
 		return nil
 	}
 
-	for _, deadReplica := range deadReplicas {
-		log.Warningf("The replica %v is being removed from its dead store.", deadReplica)
-		log.Errorf("The replica %v would be queue to remove here.", deadReplica)
-		//		TODO(bram): once remove replica is ready, uncomment this.
-		//		if err := repl.ChangeReplicas(proto.REMOVE_REPLICA, deadReplica, repl.Desc()); err != nil {
-		//			return err
-		//		}
-
-		// Enqueue the replica in the replicate queue so the new replica can be
-		// added.
-		rq.replicateQueue.MaybeAdd(repl, rq.clock.Now())
+	// Only deal with one dead replica at a time.
+	if len(deadReplicas) < 1 {
+		return util.Errorf("no dead replicas, this shouldn't happen.")
 	}
+	deadReplica := deadReplicas[0]
+	log.Warningf("The replica %v is being removed from its dead store.", deadReplica)
+	log.Errorf("The replica %v would be queue to remove here.", deadReplica)
+	//		TODO(bram): once remove replica is ready, uncomment this.
+	//		if err := repl.ChangeReplicas(proto.REMOVE_REPLICA, deadReplica, repl.Desc()); err != nil {
+	//			return err
+	//		}
 
+	// Re-enqueue to handle any other dead replicas.
+	rq.MaybeAdd(repl, rq.clock.Now())
 	return nil
 }
 
