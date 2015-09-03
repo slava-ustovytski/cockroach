@@ -41,12 +41,12 @@ const (
 type replicateQueue struct {
 	*baseQueue
 	gossip    *gossip.Gossip
-	allocator allocator
+	allocator Allocator
 	clock     *hlc.Clock
 }
 
 // makeReplicateQueue returns a new instance of replicateQueue.
-func makeReplicateQueue(gossip *gossip.Gossip, allocator allocator, clock *hlc.Clock) replicateQueue {
+func makeReplicateQueue(gossip *gossip.Gossip, allocator Allocator, clock *hlc.Clock) replicateQueue {
 	rq := replicateQueue{
 		gossip:    gossip,
 		allocator: allocator,
