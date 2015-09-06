@@ -21,6 +21,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,7 +257,7 @@ func TestConnectionSettings(t *testing.T) {
 	}
 	for _, tx := range txs {
 		// Settings work!
-		if _, err := tx.Exec(`SELECT * from kv`); err != nil {
+		if _, err := tx.Query(`SELECT * from kv`); err != nil {
 			t.Fatal(err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -286,5 +288,127 @@ func TestInsecure(t *testing.T) {
 	}()
 	if _, err := db.Exec(`SELECT 1`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func strToInts(t *testing.T, results resultSlice) []int {
+	values := make([]int, 0, 3)
+	for _, result := range results[1:] {
+		if len(result) != 1 {
+			t.Fatalf("wrong number of columns: %d", len(result))
+		}
+		strVal := result[0]
+		if strVal == nil {
+			t.Fatal("unexpected nil value")
+		}
+		value, err := strconv.Atoi(*strVal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		values = append(values, value)
+	}
+	return values
+}
+
+// concurrentIncrements starts two Goroutines in parallel, both of which
+// read the integer stored at the other's key, increment and update their own.
+// It checks that the outcome is serializable, i.e. exactly one of the
+// two Goroutines (the later write) sees the previous write by the other.
+func concurrentIncrements(db *sql.DB, t *testing.T) {
+	var wgEnd sync.WaitGroup
+	wgEnd.Add(2)
+	for i := 0; i < 2; i++ {
+		go func(i int) {
+			// Read the other key, write key i.
+			readKey := (i + 1) % 2
+			writeKey := i
+			defer wgEnd.Done()
+			// Loop until success.
+			for {
+				txn, err := db.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Although the SELECT and the UPDATE below can be combined into a
+				// single statement, we prefer them being separate to ensure that
+				// this transaction is truly a multi-statement transaction, providing
+				// plenty of opportunity to mess up serializability.
+				rows, err := txn.Query(`SELECT v FROM t.kv WHERE k = $1`, readKey)
+				if err != nil {
+					_ = txn.Rollback()
+					continue
+				}
+				results := readAll(t, rows)
+				if len(results) != 2 {
+					t.Fatalf("received %d results", len(results))
+				}
+				values := strToInts(t, results)
+				value := values[0]
+				value++
+				if _, err := txn.Exec(`UPDATE t.kv SET v = $2 WHERE k = $1`, writeKey, value); err != nil {
+					_ = txn.Rollback()
+					continue
+				}
+				if err := txn.Commit(); err != nil {
+					continue
+				}
+				// Success.
+				break
+			}
+		}(i)
+	}
+	// Wait for the goroutines to finish.
+	wgEnd.Wait()
+	rows, err := db.Query(`SELECT v FROM t.kv`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := readAll(t, rows)
+	if len(results) != 3 {
+		t.Fatalf("received %d results", len(results))
+	}
+	values := strToInts(t, results)
+	var total int
+	for _, value := range values {
+		// First writer should have 1, second one 2
+		if value < 1 || value > 2 {
+			log.Fatal("got unexpected value: %d", value)
+		}
+		total += value
+	}
+	if total != 3 {
+		t.Fatalf("got unserializable values: %v", values)
+	}
+}
+
+// TestConcurrentIncrements is a simple explicit test for serializability
+// for the concrete situation described in:
+// https://groups.google.com/forum/#!topic/cockroach-db/LdrC5_T0VNw
+// This test is a copy of the test in client/... which runs the same
+// test for the KV layer. This Belt and Suspenders test is mostly
+// documentation and adds another layer of confidence that transactions
+// are serializable and performant even at the SQL layer.
+func TestConcurrentIncrements(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	s, db := setup(t)
+	defer cleanup(s, db)
+
+	if _, err := db.Exec(`CREATE DATABASE t`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE t.kv (k BIGINT PRIMARY KEY, v BIGINT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO t.kv (k, v) VALUES (0,0),(1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	// Convenience loop: Crank up this number for testing this
+	// more often. It'll increase test duration though.
+	for k := 0; k < 5; k++ {
+		// Start with a clean slate.
+		if _, err := db.Exec(`UPDATE t.kv SET v = 0 WHERE k IN (0, 1)`); err != nil {
+			t.Fatal(err)
+		}
+		concurrentIncrements(db, t)
 	}
 }
