@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -36,7 +37,7 @@ import (
 var maxTransfer = flag.Int("max-transfer", 999, "Maximum amount to transfer in one transaction.")
 var numAccounts = flag.Int("num-accounts", 999, "Number of accounts.")
 var concurrency = flag.Int("concurrency", 5, "Number of concurrent actors moving money.")
-var aggregate = flag.Bool("aggregate", true, "Use aggregate function to verify conservation of money.")
+var transferStyle = flag.Int("transfer-style", 0, "0: single UPDATE, 1: transactional")
 var usePostgres = flag.Bool("use-postgres", false, "Use postgres instead of cockroach.")
 var balanceCheckInterval = flag.Duration("balance-check-interval", 1*time.Second, "Interval of balance check.")
 
@@ -49,76 +50,80 @@ func moveMoney(db *sql.DB) {
 			continue
 		}
 		amount := rand.Intn(*maxTransfer)
-		tx, err := db.Begin()
-		if err != nil {
-			log.Fatal(err)
-		}
-		startTime := time.Now()
-		query := fmt.Sprintf("SELECT id, balance FROM accounts WHERE id IN (%d, %d)", from, to)
-		rows, err := tx.Query(query)
-		elapsed := time.Now().Sub(startTime)
-		if elapsed > 10*time.Millisecond {
-			log.Infof("%s took %v", query, elapsed)
-		}
-		if err != nil {
-			if log.V(1) {
-				log.Warning(err)
-			}
-			if err = tx.Rollback(); err != nil {
-				log.Fatal(err)
-			}
-			continue
-		}
-		var fromBalance, toBalance int
-		for rows.Next() {
-			var id, balance int
-			if err = rows.Scan(&id, &balance); err != nil {
-				log.Fatal(err)
-			}
-			switch id {
-			case from:
-				fromBalance = balance
-			case to:
-				toBalance = balance
-			default:
-				panic(fmt.Sprintf("got unexpected account %d", id))
-			}
-		}
-		startTime = time.Now()
-		update := fmt.Sprintf("UPDATE accounts SET balance=%d WHERE id=%d", fromBalance-amount, from)
-		if _, err = tx.Exec(update); err != nil {
-			if log.V(1) {
-				log.Warning(err)
-			}
-			if err = tx.Rollback(); err != nil {
-				log.Fatal(err)
-			}
-			continue
-		}
-		elapsed = time.Now().Sub(startTime)
-		if elapsed > 50*time.Millisecond {
-			log.Infof("%s took %v", update, elapsed)
-		}
-		update = fmt.Sprintf("UPDATE accounts SET balance=%d WHERE id=%d", toBalance+amount, to)
-		if _, err = tx.Exec(update); err != nil {
-			if log.V(1) {
-				log.Warning(err)
-			}
-			if err = tx.Rollback(); err != nil {
-				log.Fatal(err)
-			}
-			continue
-		}
-		elapsed = time.Now().Sub(startTime)
-		if elapsed > 50*time.Millisecond {
-			log.Infof("%s took %v", update, elapsed)
-		}
 
-		if err = tx.Commit(); err != nil {
-			if log.V(1) {
-				log.Warning(err)
+		switch *transferStyle {
+		case 0:
+			update := `
+UPDATE bank.accounts
+  SET balance = CASE id WHEN $1 THEN balance-$3 WHEN $2 THEN balance+$3 END
+  WHERE id IN ($1, $2)
+`
+			if _, err := db.Exec(update, from, to, amount); err != nil {
+				if log.V(1) {
+					log.Warning(err)
+				}
+				continue
 			}
-		} else {
+			atomic.AddUint64(&numTransfers, 1)
+
+		case 1:
+			tx, err := db.Begin()
+			if err != nil {
+				log.Fatal(err)
+			}
+			query := fmt.Sprintf("SELECT id, balance FROM accounts WHERE id IN (%d, %d)", from, to)
+			rows, err := tx.Query(query)
+			if err != nil {
+				if log.V(1) {
+					log.Warning(err)
+				}
+				if err = tx.Rollback(); err != nil {
+					log.Fatal(err)
+				}
+				continue
+			}
+			var fromBalance, toBalance int
+			for rows.Next() {
+				var id, balance int
+				if err = rows.Scan(&id, &balance); err != nil {
+					log.Fatal(err)
+				}
+				switch id {
+				case from:
+					fromBalance = balance
+				case to:
+					toBalance = balance
+				default:
+					panic(fmt.Sprintf("got unexpected account %d", id))
+				}
+			}
+			update := fmt.Sprintf("UPDATE accounts SET balance=%d WHERE id=%d", fromBalance-amount, from)
+			if _, err = tx.Exec(update); err != nil {
+				if log.V(1) {
+					log.Warning(err)
+				}
+				if err = tx.Rollback(); err != nil {
+					log.Fatal(err)
+				}
+				continue
+			}
+			update = fmt.Sprintf("UPDATE accounts SET balance=%d WHERE id=%d", toBalance+amount, to)
+			if _, err = tx.Exec(update); err != nil {
+				if log.V(1) {
+					log.Warning(err)
+				}
+				if err = tx.Rollback(); err != nil {
+					log.Fatal(err)
+				}
+				continue
+			}
+
+			if err = tx.Commit(); err != nil {
+				if log.V(1) {
+					log.Warning(err)
+				}
+				continue
+			}
 			atomic.AddUint64(&numTransfers, 1)
 		}
 	}
@@ -126,35 +131,14 @@ func moveMoney(db *sql.DB) {
 
 func verifyBank(db *sql.DB) {
 	var sum int64
-	if *aggregate {
-		if err := db.QueryRow("SELECT SUM(balance) FROM accounts").Scan(&sum); err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		tx, err := db.Begin()
-		if err != nil {
-			log.Fatal(err)
-		}
-		rows, err := tx.Query("SELECT balance FROM accounts")
-		if err != nil {
-			log.Fatal(err)
-		}
-		for rows.Next() {
-			var balance int64
-			if err = rows.Scan(&balance); err != nil {
-				log.Fatal(err)
-			}
-			sum += balance
-		}
-		if err = tx.Commit(); err != nil {
-			log.Fatal(err)
-		}
+	if err := db.QueryRow("SELECT SUM(balance) FROM accounts").Scan(&sum); err != nil {
+		log.Fatal(err)
 	}
-
 	if sum == 0 {
 		log.Info("The bank is in good order.")
 	} else {
-		log.Fatalf("The bank is not in good order. Total value: %d", sum)
+		log.Errorf("The bank is not in good order. Total value: %d", sum)
+		os.Exit(1)
 	}
 }
 
